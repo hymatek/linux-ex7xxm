@@ -184,6 +184,20 @@ __setup("pcie_tse1addr=",getpciemac1addr);
 __setup("pcie_tse2addr=",getpciemac2addr);
 
 /*
+ * Export the hw_dispid for display panel identification from cmdline
+ */
+int hw_dispid = 0xFFFF;
+EXPORT_SYMBOL(hw_dispid);
+
+static int __init getdispid(char* str)
+{
+  hw_dispid = simple_strtol(str, NULL, 0);
+  return 1;
+}
+
+__setup("hw_dispid=", getdispid);
+
+/*
  * Used to generate warnings if static_key manipulation functions are used
  * before jump_label_init is called.
  */
