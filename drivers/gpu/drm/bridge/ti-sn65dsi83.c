@@ -783,9 +783,14 @@ static int sn65dsi83_host_attach(struct sn65dsi83 *ctx)
 
 	dsi->lanes = dsi_lanes;
 	dsi->format = MIPI_DSI_FMT_RGB888;
-	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
-			  MIPI_DSI_MODE_VIDEO_NO_HFP | MIPI_DSI_MODE_VIDEO_NO_HBP |
-			  MIPI_DSI_MODE_VIDEO_NO_HSA | MIPI_DSI_MODE_NO_EOT_PACKET;
+	/*
+	 * Match the working linux-imx 6.6.52 bridge driver: request only plain
+	 * burst video mode. The upstream defaults (NO_HFP/NO_HBP/NO_HSA/
+	 * NO_EOT_PACKET) make samsung-dsim emit a stripped DSI stream the
+	 * SN65DSI8x cannot synchronise to (CHA_SYNCH_ERR, black screen). Full
+	 * sync/porch + EoT is what this bridge needs.
+	 */
+	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST;
 
 	ret = devm_mipi_dsi_attach(dev, dsi);
 	if (ret < 0) {
