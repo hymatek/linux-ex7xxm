@@ -895,7 +895,9 @@ static int samsung_dsim_init_link(struct samsung_dsim *dsi)
 		 * The user manual describes that following bits are ignored in
 		 * command mode.
 		 */
-		if (!(dsi->mode_flags & MIPI_DSI_MODE_VSYNC_FLUSH))
+		/* sec-dsim does not set MFLUSH_VS on i.MX; match it (non-Exynos). */
+		if (!(dsi->mode_flags & MIPI_DSI_MODE_VSYNC_FLUSH) &&
+		    samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type))
 			reg |= DSIM_MFLUSH_VS;
 		if (dsi->mode_flags & MIPI_DSI_MODE_VIDEO_SYNC_PULSE)
 			reg |= DSIM_SYNC_INFORM;
@@ -966,7 +968,9 @@ static int samsung_dsim_init_link(struct samsung_dsim *dsi)
 
 	reg = samsung_dsim_read(dsi, DSIM_ESCMODE_REG);
 	reg &= ~DSIM_STOP_STATE_CNT_MASK;
-	reg |= DSIM_STOP_STATE_CNT(driver_data->reg_values[STOP_STATE_CNT]);
+	/* sec-dsim leaves STOP_STATE_CNT at 0 on i.MX; match it (non-Exynos). */
+	if (samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type))
+		reg |= DSIM_STOP_STATE_CNT(driver_data->reg_values[STOP_STATE_CNT]);
 	samsung_dsim_write(dsi, DSIM_ESCMODE_REG, reg);
 
 	reg = DSIM_BTA_TIMEOUT(0xff) | DSIM_LPDR_TIMEOUT(0xffff);
@@ -1004,6 +1008,20 @@ static void samsung_dsim_set_display_mode(struct samsung_dsim *dsi)
 		hfp = max(hfp - 6, 0);
 		hbp = max(hbp - 6, 0);
 		hsa = max(hsa - 6, 0);
+
+		/*
+		 * In burst mode NXP's sec-dsim sends minimal horizontal
+		 * blanking (1 byte-clock each) and lets the SN65DSI8x derive
+		 * the line timing from its own LVDS-side registers. samsung-dsim
+		 * sends the full pixel-derived porch (~43 byte-clocks here),
+		 * which lands the active region where the bridge does not expect
+		 * it (black with clean sync). Match sec-dsim on non-Exynos.
+		 */
+		if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type)) {
+			hfp = 1;
+			hbp = 1;
+			hsa = 1;
+		}
 
 		dev_dbg(dsi->dev, "calculated hfp: %u, hbp: %u, hsa: %u",
 			hfp, hbp, hsa);
