@@ -759,9 +759,35 @@ static void samsung_dsim_set_phy_ctrl(struct samsung_dsim *dsi)
 	hs_zero = PS_TO_CYCLE(cfg.hs_zero, byte_clock);
 	hs_trail = PS_TO_CYCLE(cfg.hs_trail, byte_clock);
 
+	/*
+	 * samsung-dsim's PS_TO_CYCLE() approximation lands the HS/clock-lane
+	 * D-PHY timing at the bare MIPI D-PHY spec minimum (CLK_PREPARE +
+	 * CLK_ZERO = 300ns exactly at ~800 Mbps/lane). The SN65DSI8x receiver
+	 * needs the margin that NXP's sec-dsim lookup table provides and fails
+	 * to sample the HS payload otherwise: the screen stays black even
+	 * though SOT/sync are still detected (bridge IRQ_STAT = 0). Override
+	 * the computed values with the sec-dsim timing captured live from a
+	 * working boot at 1080p@56 / ~800 Mbps-lane on non-Exynos parts.
+	 */
+	if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type)) {
+		lpx = 6;
+		hs_exit = 10;
+		clk_prepare = 7;
+		clk_zero = 35;
+		clk_post = 12;
+		clk_trail = 7;
+		hs_prepare = 7;
+		hs_zero = 12;
+		hs_trail = 10;
+	}
+
 	/* B D-PHY: D-PHY Master & Slave Analog Block control */
 	reg = reg_values[PHYCTRL_ULPS_EXIT] | reg_values[PHYCTRL_VREG_LP] |
 		reg_values[PHYCTRL_SLEW_UP];
+
+	/* sec-dsim leaves PHYCTRL at 0 (no ULPS-exit delay) on i.MX. */
+	if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type))
+		reg = 0;
 
 	samsung_dsim_write(dsi, DSIM_PHYCTRL_REG, reg);
 
