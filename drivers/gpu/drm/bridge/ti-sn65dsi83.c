@@ -353,6 +353,30 @@ static u8 sn65dsi83_get_dsi_div(struct sn65dsi83 *ctx)
 	return dsi_div - 1;
 }
 
+/* Enable the LVDS PLL, wait for lock, then issue the CSR soft reset. */
+static int sn65dsi83_enable_pll(struct sn65dsi83 *ctx)
+{
+	unsigned int pval;
+	int ret;
+
+	regmap_write(ctx->regmap, REG_RC_PLL_EN, REG_RC_PLL_EN_PLL_EN);
+	usleep_range(3000, 4000);
+	ret = regmap_read_poll_timeout(ctx->regmap, REG_RC_LVDS_PLL, pval,
+				       pval & REG_RC_LVDS_PLL_PLL_EN_STAT,
+				       1000, 100000);
+	if (ret) {
+		dev_err(ctx->dev, "failed to lock PLL, ret=%i\n", ret);
+		regmap_write(ctx->regmap, REG_RC_PLL_EN, 0x00);
+		return ret;
+	}
+
+	/* Trigger reset after CSR register update. */
+	regmap_write(ctx->regmap, REG_RC_RESET, REG_RC_RESET_SOFT_RESET);
+	/* Wait for 10ms after soft reset as specified in datasheet */
+	usleep_range(10000, 12000);
+	return 0;
+}
+
 static void sn65dsi83_atomic_pre_enable(struct drm_bridge *bridge,
 					struct drm_bridge_state *old_bridge_state)
 {
@@ -534,18 +558,35 @@ static void sn65dsi83_atomic_pre_enable(struct drm_bridge *bridge,
 	 * the panel locks correctly with these values. Vertical timing keeps
 	 * the real mode values.
 	 */
-	le16val = cpu_to_le16(1);
-	regmap_bulk_write(ctx->regmap, REG_VID_CHA_HSYNC_PULSE_WIDTH_LOW,
-			  &le16val, 2);
-	le16val = cpu_to_le16(mode->vsync_end - mode->vsync_start);
-	regmap_bulk_write(ctx->regmap, REG_VID_CHA_VSYNC_PULSE_WIDTH_LOW,
-			  &le16val, 2);
-	regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_BACK_PORCH, 1);
-	regmap_write(ctx->regmap, REG_VID_CHA_VERTICAL_BACK_PORCH,
-		     mode->vtotal - mode->vsync_end);
-	regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_FRONT_PORCH, 1);
-	regmap_write(ctx->regmap, REG_VID_CHA_VERTICAL_FRONT_PORCH,
-		     mode->vsync_start - mode->vdisplay);
+	{
+		/*
+		 * Dual-link (21" G215HVN01): force HSW/HBP/HFP=1 to match
+		 * samsung-dsim's minimal-porch DSI frame, else CHA_SYNCH_ERR ->
+		 * black. Single-link panels (10") run mainline samsung-dsim
+		 * timing which sends the real pixel-derived porch, so the bridge
+		 * must program the real mode values or the panel cannot lock
+		 * (rolling/garbled). Vertical timing always uses real values.
+		 */
+		u16 hsw = ctx->lvds_dual_link ? 1 :
+			  (mode->hsync_end - mode->hsync_start);
+		u16 hbp = ctx->lvds_dual_link ? 1 :
+			  (mode->htotal - mode->hsync_end);
+		u16 hfp = ctx->lvds_dual_link ? 1 :
+			  (mode->hsync_start - mode->hdisplay);
+
+		le16val = cpu_to_le16(hsw);
+		regmap_bulk_write(ctx->regmap, REG_VID_CHA_HSYNC_PULSE_WIDTH_LOW,
+				  &le16val, 2);
+		le16val = cpu_to_le16(mode->vsync_end - mode->vsync_start);
+		regmap_bulk_write(ctx->regmap, REG_VID_CHA_VSYNC_PULSE_WIDTH_LOW,
+				  &le16val, 2);
+		regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_BACK_PORCH, hbp);
+		regmap_write(ctx->regmap, REG_VID_CHA_VERTICAL_BACK_PORCH,
+			     mode->vtotal - mode->vsync_end);
+		regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_FRONT_PORCH, hfp);
+		regmap_write(ctx->regmap, REG_VID_CHA_VERTICAL_FRONT_PORCH,
+			     mode->vsync_start - mode->vdisplay);
+	}
 	regmap_write(ctx->regmap, REG_VID_CHA_TEST_PATTERN, 0x00);
 
 	/*
@@ -554,11 +595,17 @@ static void sn65dsi83_atomic_pre_enable(struct drm_bridge *bridge,
 	 * from the CHA timing; the working linux-imx 6.6.52 driver leaves CHB
 	 * untouched. Programming it here misconfigured the chip.
 	 *
-	 * PLL enable + soft reset are deliberately deferred to atomic_enable():
-	 * the bridge must be activated AFTER the DSI host has started the video
-	 * stream, otherwise the chip soft-resets onto a dead link and never
-	 * locks (black screen). Mirrors linux-imx commit a7c5bc19a417.
+	 * PLL enable + soft reset:
+	 *  - dual-link (21"): deferred to atomic_enable() so the bridge locks
+	 *    onto an already-running DSI video stream (mirrors linux-imx
+	 *    a7c5bc19a417); enabling it here left it reset onto a dead link.
+	 *  - single-link (10" etc.): use the mainline location (here). Deferring
+	 *    it on these panels caused an intermittent PLL-lock race at boot
+	 *    (occasional black / rolling / colored edge). This restores the
+	 *    bring-up sequence they booted reliably with for months.
 	 */
+	if (!ctx->lvds_dual_link)
+		sn65dsi83_enable_pll(ctx);
 }
 
 static void sn65dsi83_atomic_enable(struct drm_bridge *bridge,
@@ -566,29 +613,15 @@ static void sn65dsi83_atomic_enable(struct drm_bridge *bridge,
 {
 	struct sn65dsi83 *ctx = bridge_to_sn65dsi83(bridge);
 	unsigned int pval;
-	int ret;
 
 	/*
-	 * Enable PLL and soft-reset HERE (not in atomic_pre_enable): the DSI
-	 * host has now started the video stream, so the bridge locks onto a
-	 * live link. Doing this before the stream exists left the chip reset
-	 * onto a dead link (black screen). Mirrors linux-imx a7c5bc19a417.
+	 * Dual-link (21"): enable PLL + soft-reset HERE, after the DSI host has
+	 * started the video stream, so the bridge locks onto a live link.
+	 * Single-link panels already did this in atomic_pre_enable() (mainline
+	 * sequence) to avoid an intermittent boot PLL-lock race.
 	 */
-	regmap_write(ctx->regmap, REG_RC_PLL_EN, REG_RC_PLL_EN_PLL_EN);
-	usleep_range(3000, 4000);
-	ret = regmap_read_poll_timeout(ctx->regmap, REG_RC_LVDS_PLL, pval,
-				       pval & REG_RC_LVDS_PLL_PLL_EN_STAT,
-				       1000, 100000);
-	if (ret) {
-		dev_err(ctx->dev, "failed to lock PLL, ret=%i\n", ret);
-		regmap_write(ctx->regmap, REG_RC_PLL_EN, 0x00);
+	if (ctx->lvds_dual_link && sn65dsi83_enable_pll(ctx))
 		return;
-	}
-
-	/* Trigger reset after CSR register update. */
-	regmap_write(ctx->regmap, REG_RC_RESET, REG_RC_RESET_SOFT_RESET);
-	/* Wait for 10ms after soft reset as specified in datasheet */
-	usleep_range(10000, 12000);
 
 	/* Clear all errors that got asserted during initialization. */
 	regmap_read(ctx->regmap, REG_IRQ_STAT, &pval);
@@ -780,16 +813,34 @@ static int sn65dsi83_host_attach(struct sn65dsi83 *ctx)
 
 	ctx->dsi = dsi;
 
+	/*
+	 * The shared DT declares 4 DSI lanes because the dual-link 21" panel
+	 * needs that bandwidth at 1080p. Single-link panels (10" etc.) ran on
+	 * 2 lanes historically; forcing 4 lanes on them lowers the DSI HS clock
+	 * that the bridge's LVDS PLL is referenced to (REG_RC_LVDS_PLL bit0,
+	 * HS_CLK_SRC = DSI) and degrades the regenerated LVDS pixel clock,
+	 * producing brightness shading and vertical stripes even though the DSI
+	 * link itself is clean (IRQ_STAT = 0). Clamp single-link panels to 2.
+	 */
+	if (!ctx->lvds_dual_link && dsi_lanes > 2)
+		dsi_lanes = 2;
+
 	dsi->lanes = dsi_lanes;
 	dsi->format = MIPI_DSI_FMT_RGB888;
 	/*
-	 * Match the working linux-imx 6.6.52 bridge driver: request only plain
-	 * burst video mode. The upstream defaults (NO_HFP/NO_HBP/NO_HSA/
-	 * NO_EOT_PACKET) make samsung-dsim emit a stripped DSI stream the
-	 * SN65DSI8x cannot synchronise to (CHA_SYNCH_ERR, black screen). Full
-	 * sync/porch + EoT is what this bridge needs.
+	 * Dual-link (21" G215HVN01): request only plain burst video mode. The
+	 * upstream defaults (NO_HFP/NO_HBP/NO_HSA/NO_EOT_PACKET) make
+	 * samsung-dsim emit a stripped DSI stream this dual-link panel cannot
+	 * synchronise to (CHA_SYNCH_ERR, black). Single-link panels (10") need
+	 * the mainline flags so samsung-dsim sends the real porch the bridge
+	 * programs on its LVDS side; with plain burst they roll/garble.
 	 */
 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST;
+	if (!ctx->lvds_dual_link)
+		dsi->mode_flags |= MIPI_DSI_MODE_VIDEO_NO_HFP |
+				   MIPI_DSI_MODE_VIDEO_NO_HBP |
+				   MIPI_DSI_MODE_VIDEO_NO_HSA |
+				   MIPI_DSI_MODE_NO_EOT_PACKET;
 
 	ret = devm_mipi_dsi_attach(dev, dsi);
 	if (ret < 0) {

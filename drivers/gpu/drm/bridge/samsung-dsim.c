@@ -769,7 +769,18 @@ static void samsung_dsim_set_phy_ctrl(struct samsung_dsim *dsi)
 	 * the computed values with the sec-dsim timing captured live from a
 	 * working boot at 1080p@56 / ~800 Mbps-lane on non-Exynos parts.
 	 */
-	if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type)) {
+	/*
+	 * These cycle counts were captured from the dual-link 21" G215HVN01
+	 * (1920x1080) and only suit that panel; on the single-link panels
+	 * (1280x800 etc.) mainline's per-rate PS_TO_CYCLE timing is correct,
+	 * and forcing these values caused SOT/LLP errors and frame slips.
+	 * Discriminate by resolution, NOT bit-rate: the single-link panel is
+	 * clamped to 2 lanes (~900 Mbps/lane), the same per-lane rate as the
+	 * 21" on 4 lanes, so hs_clock cannot tell them apart. Only the 21"
+	 * dual-link panel is >= 1600 px wide.
+	 */
+	if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type) &&
+	    dsi->mode.hdisplay >= 1600) {
 		lpx = 6;
 		hs_exit = 10;
 		clk_prepare = 7;
@@ -785,8 +796,10 @@ static void samsung_dsim_set_phy_ctrl(struct samsung_dsim *dsi)
 	reg = reg_values[PHYCTRL_ULPS_EXIT] | reg_values[PHYCTRL_VREG_LP] |
 		reg_values[PHYCTRL_SLEW_UP];
 
-	/* sec-dsim leaves PHYCTRL at 0 (no ULPS-exit delay) on i.MX. */
-	if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type))
+	/* sec-dsim leaves PHYCTRL at 0 (no ULPS-exit delay) on i.MX; only the
+	 * dual-link 21" panel needs this (see resolution gate above). */
+	if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type) &&
+	    dsi->mode.hdisplay >= 1600)
 		reg = 0;
 
 	samsung_dsim_write(dsi, DSIM_PHYCTRL_REG, reg);
@@ -895,9 +908,13 @@ static int samsung_dsim_init_link(struct samsung_dsim *dsi)
 		 * The user manual describes that following bits are ignored in
 		 * command mode.
 		 */
-		/* sec-dsim does not set MFLUSH_VS on i.MX; match it (non-Exynos). */
+		/* sec-dsim does not set MFLUSH_VS on i.MX for the dual-link 21"
+		 * panel; single-link panels keep the mainline behaviour (set it).
+		 * MFLUSH_VS flushes the FIFO at every vsync; dropping it on the
+		 * single-link panel caused intermittent vertical frame slips. */
 		if (!(dsi->mode_flags & MIPI_DSI_MODE_VSYNC_FLUSH) &&
-		    samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type))
+		    (samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type) ||
+		     dsi->mode.hdisplay < 1600))
 			reg |= DSIM_MFLUSH_VS;
 		if (dsi->mode_flags & MIPI_DSI_MODE_VIDEO_SYNC_PULSE)
 			reg |= DSIM_SYNC_INFORM;
@@ -968,8 +985,10 @@ static int samsung_dsim_init_link(struct samsung_dsim *dsi)
 
 	reg = samsung_dsim_read(dsi, DSIM_ESCMODE_REG);
 	reg &= ~DSIM_STOP_STATE_CNT_MASK;
-	/* sec-dsim leaves STOP_STATE_CNT at 0 on i.MX; match it (non-Exynos). */
-	if (samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type))
+	/* sec-dsim leaves STOP_STATE_CNT at 0 on i.MX for the dual-link 21"
+	 * panel; single-link panels keep mainline (set it). */
+	if (samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type) ||
+	    dsi->mode.hdisplay < 1600)
 		reg |= DSIM_STOP_STATE_CNT(driver_data->reg_values[STOP_STATE_CNT]);
 	samsung_dsim_write(dsi, DSIM_ESCMODE_REG, reg);
 
@@ -1017,7 +1036,8 @@ static void samsung_dsim_set_display_mode(struct samsung_dsim *dsi)
 		 * which lands the active region where the bridge does not expect
 		 * it (black with clean sync). Match sec-dsim on non-Exynos.
 		 */
-		if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type)) {
+		if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type) &&
+		    m->hdisplay >= 1600) {
 			hfp = 1;
 			hbp = 1;
 			hsa = 1;
