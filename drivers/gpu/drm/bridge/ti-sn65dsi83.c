@@ -459,13 +459,16 @@ static void sn65dsi83_atomic_pre_enable(struct drm_bridge *bridge,
 	 * mirror the CHA lane count to CHB so the chip properly drives both
 	 * LVDS channels from one DSI input.
 	 */
+	/*
+	 * Match the working linux-imx 6.6.52 driver: this board is a single
+	 * DSI input feeding dual-link LVDS (SN65DSI84 topology), NOT dual DSI
+	 * channel. Use SINGLE channel mode; the previous DUAL mode made the
+	 * chip wait for a second DSI input that does not exist (black screen).
+	 */
 	regmap_write(ctx->regmap, REG_DSI_LANE,
-		     (ctx->lvds_dual_link ? 0 :
-		      REG_DSI_LANE_DSI_CHANNEL_MODE_SINGLE) |
+		     REG_DSI_LANE_DSI_CHANNEL_MODE_SINGLE |
 		     REG_DSI_LANE_CHA_DSI_LANES(~(ctx->dsi->lanes - 1)) |
-		     (ctx->lvds_dual_link ?
-		      REG_DSI_LANE_CHB_DSI_LANES(~(ctx->dsi->lanes - 1)) :
-		      REG_DSI_LANE_CHB_DSI_LANES(3)));
+		     REG_DSI_LANE_CHB_DSI_LANES(3));
 	/* No equalization. */
 	regmap_write(ctx->regmap, REG_DSI_EQ, 0x00);
 
@@ -519,70 +522,43 @@ static void sn65dsi83_atomic_pre_enable(struct drm_bridge *bridge,
 	/* 32 + 1 pixel clock to ensure proper operation */
 	le16val = cpu_to_le16(32 + 1);
 	regmap_bulk_write(ctx->regmap, REG_VID_CHA_SYNC_DELAY_LOW, &le16val, 2);
-	le16val = cpu_to_le16(mode->hsync_end - mode->hsync_start);
+	/*
+	 * Horizontal HSW/HBP/HFP are forced to 1 (minimum), NOT the mode's
+	 * pixel values. mainline samsung-dsim emits a DSI video frame with
+	 * minimal horizontal blanking (its MHPORCH/MSYNC are forced to 1 for
+	 * SN65DSI8x), so the bridge's CHA horizontal sync check must expect
+	 * the same minimal porch or it raises CHA_SYNCH_ERR (0xe5 bit7) and
+	 * mutes the LVDS output -> black screen. Confirmed live via i2c: with
+	 * HSW/HBP/HFP=1 the SYNCH_ERR clears and the panel renders. The LVDS
+	 * output line timing is derived by the bridge from the active region;
+	 * the panel locks correctly with these values. Vertical timing keeps
+	 * the real mode values.
+	 */
+	le16val = cpu_to_le16(1);
 	regmap_bulk_write(ctx->regmap, REG_VID_CHA_HSYNC_PULSE_WIDTH_LOW,
 			  &le16val, 2);
 	le16val = cpu_to_le16(mode->vsync_end - mode->vsync_start);
 	regmap_bulk_write(ctx->regmap, REG_VID_CHA_VSYNC_PULSE_WIDTH_LOW,
 			  &le16val, 2);
-	regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_BACK_PORCH,
-		     mode->htotal - mode->hsync_end);
+	regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_BACK_PORCH, 1);
 	regmap_write(ctx->regmap, REG_VID_CHA_VERTICAL_BACK_PORCH,
 		     mode->vtotal - mode->vsync_end);
-	regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_FRONT_PORCH,
-		     mode->hsync_start - mode->hdisplay);
+	regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_FRONT_PORCH, 1);
 	regmap_write(ctx->regmap, REG_VID_CHA_VERTICAL_FRONT_PORCH,
 		     mode->vsync_start - mode->vdisplay);
 	regmap_write(ctx->regmap, REG_VID_CHA_TEST_PATTERN, 0x00);
 
 	/*
-	 * In dual-link mode, mirror the same timings to channel B. Without this
-	 * the CHB registers stay at zero which the chip interprets as "channel B
-	 * muted", leaving only the left half of a dual-link panel driven.
+	 * CHB video timing is intentionally NOT programmed. For single-DSI-input
+	 * dual-link LVDS (SN65DSI84 topology) the chip drives both LVDS links
+	 * from the CHA timing; the working linux-imx 6.6.52 driver leaves CHB
+	 * untouched. Programming it here misconfigured the chip.
+	 *
+	 * PLL enable + soft reset are deliberately deferred to atomic_enable():
+	 * the bridge must be activated AFTER the DSI host has started the video
+	 * stream, otherwise the chip soft-resets onto a dead link and never
+	 * locks (black screen). Mirrors linux-imx commit a7c5bc19a417.
 	 */
-	if (ctx->lvds_dual_link) {
-		le16val = cpu_to_le16(mode->hdisplay);
-		regmap_bulk_write(ctx->regmap, REG_VID_CHB_ACTIVE_LINE_LENGTH_LOW,
-				  &le16val, 2);
-		le16val = cpu_to_le16(mode->vdisplay);
-		regmap_bulk_write(ctx->regmap, REG_VID_CHB_VERTICAL_DISPLAY_SIZE_LOW,
-				  &le16val, 2);
-		le16val = cpu_to_le16(32 + 1);
-		regmap_bulk_write(ctx->regmap, REG_VID_CHB_SYNC_DELAY_LOW, &le16val, 2);
-		le16val = cpu_to_le16(mode->hsync_end - mode->hsync_start);
-		regmap_bulk_write(ctx->regmap, REG_VID_CHB_HSYNC_PULSE_WIDTH_LOW,
-				  &le16val, 2);
-		le16val = cpu_to_le16(mode->vsync_end - mode->vsync_start);
-		regmap_bulk_write(ctx->regmap, REG_VID_CHB_VSYNC_PULSE_WIDTH_LOW,
-				  &le16val, 2);
-		regmap_write(ctx->regmap, REG_VID_CHB_HORIZONTAL_BACK_PORCH,
-			     mode->htotal - mode->hsync_end);
-		regmap_write(ctx->regmap, REG_VID_CHB_VERTICAL_BACK_PORCH,
-			     mode->vtotal - mode->vsync_end);
-		regmap_write(ctx->regmap, REG_VID_CHB_HORIZONTAL_FRONT_PORCH,
-			     mode->hsync_start - mode->hdisplay);
-		regmap_write(ctx->regmap, REG_VID_CHB_VERTICAL_FRONT_PORCH,
-			     mode->vsync_start - mode->vdisplay);
-	}
-
-	/* Enable PLL */
-	regmap_write(ctx->regmap, REG_RC_PLL_EN, REG_RC_PLL_EN_PLL_EN);
-	usleep_range(3000, 4000);
-	ret = regmap_read_poll_timeout(ctx->regmap, REG_RC_LVDS_PLL, pval,
-				       pval & REG_RC_LVDS_PLL_PLL_EN_STAT,
-				       1000, 100000);
-	if (ret) {
-		dev_err(ctx->dev, "failed to lock PLL, ret=%i\n", ret);
-		/* On failure, disable PLL again and exit. */
-		regmap_write(ctx->regmap, REG_RC_PLL_EN, 0x00);
-		return;
-	}
-
-	/* Trigger reset after CSR register update. */
-	regmap_write(ctx->regmap, REG_RC_RESET, REG_RC_RESET_SOFT_RESET);
-
-	/* Wait for 10ms after soft reset as specified in datasheet */
-	usleep_range(10000, 12000);
 }
 
 static void sn65dsi83_atomic_enable(struct drm_bridge *bridge,
@@ -590,6 +566,29 @@ static void sn65dsi83_atomic_enable(struct drm_bridge *bridge,
 {
 	struct sn65dsi83 *ctx = bridge_to_sn65dsi83(bridge);
 	unsigned int pval;
+	int ret;
+
+	/*
+	 * Enable PLL and soft-reset HERE (not in atomic_pre_enable): the DSI
+	 * host has now started the video stream, so the bridge locks onto a
+	 * live link. Doing this before the stream exists left the chip reset
+	 * onto a dead link (black screen). Mirrors linux-imx a7c5bc19a417.
+	 */
+	regmap_write(ctx->regmap, REG_RC_PLL_EN, REG_RC_PLL_EN_PLL_EN);
+	usleep_range(3000, 4000);
+	ret = regmap_read_poll_timeout(ctx->regmap, REG_RC_LVDS_PLL, pval,
+				       pval & REG_RC_LVDS_PLL_PLL_EN_STAT,
+				       1000, 100000);
+	if (ret) {
+		dev_err(ctx->dev, "failed to lock PLL, ret=%i\n", ret);
+		regmap_write(ctx->regmap, REG_RC_PLL_EN, 0x00);
+		return;
+	}
+
+	/* Trigger reset after CSR register update. */
+	regmap_write(ctx->regmap, REG_RC_RESET, REG_RC_RESET_SOFT_RESET);
+	/* Wait for 10ms after soft reset as specified in datasheet */
+	usleep_range(10000, 12000);
 
 	/* Clear all errors that got asserted during initialization. */
 	regmap_read(ctx->regmap, REG_IRQ_STAT, &pval);
