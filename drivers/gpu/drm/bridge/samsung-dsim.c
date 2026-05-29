@@ -966,6 +966,21 @@ static void samsung_dsim_set_display_mode(struct samsung_dsim *dsi)
 		hbp = max(hbp - 6, 0);
 		hsa = max(hsa - 6, 0);
 
+		/*
+		 * In burst mode NXP's sec-dsim sends minimal horizontal
+		 * blanking (1 byte-clock each) and lets the SN65DSI8x derive
+		 * the line timing from its own LVDS-side registers. samsung-dsim
+		 * sends the full pixel-derived porch (~43 byte-clocks here),
+		 * which lands the active region where the bridge does not expect
+		 * it (black with clean sync). Match sec-dsim on non-Exynos.
+		 */
+		if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type) &&
+		    m->hdisplay >= 1600) {
+			hfp = 1;
+			hbp = 1;
+			hsa = 1;
+		}
+
 		dev_dbg(dsi->dev, "calculated hfp: %u, hbp: %u, hsa: %u",
 			hfp, hbp, hsa);
 
