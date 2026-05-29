@@ -132,6 +132,21 @@
 #define  REG_IRQ_STAT_CHA_SOT_BIT_ERR		BIT(2)
 #define  REG_IRQ_STAT_CHA_PLL_UNLOCK		BIT(0)
 
+int volatile f_sn65dsi84_dual_lvds = 0;
+EXPORT_SYMBOL(f_sn65dsi84_dual_lvds);
+
+/* Sync polarity flags set by the panel driver from the displayconfig table.
+ * On i.MX8MM the Samsung DSIM atomic_check forces NHSYNC|NVSYNC into the
+ * adjusted mode (to compensate for LCDIF-to-DSIM glue inversion), which
+ * corrupts mode->flags for this downstream bridge. These globals carry the
+ * panel's real polarity so the bridge programs LVDS_FMT correctly.
+ * -1 = not set (use mode->flags), 0 = active high, 1 = active low.
+ */
+int volatile f_sn65dsi8x_hs_neg = -1;
+int volatile f_sn65dsi8x_vs_neg = -1;
+EXPORT_SYMBOL(f_sn65dsi8x_hs_neg);
+EXPORT_SYMBOL(f_sn65dsi8x_vs_neg);
+
 enum sn65dsi83_model {
 	MODEL_SN65DSI83,
 	MODEL_SN65DSI84,
@@ -322,6 +337,30 @@ static u8 sn65dsi83_get_dsi_div(struct sn65dsi83 *ctx)
 	return dsi_div - 1;
 }
 
+/* Enable the LVDS PLL, wait for lock, then issue the CSR soft reset. */
+static int sn65dsi83_enable_pll(struct sn65dsi83 *ctx)
+{
+	unsigned int pval;
+	int ret;
+
+	regmap_write(ctx->regmap, REG_RC_PLL_EN, REG_RC_PLL_EN_PLL_EN);
+	usleep_range(3000, 4000);
+	ret = regmap_read_poll_timeout(ctx->regmap, REG_RC_LVDS_PLL, pval,
+				       pval & REG_RC_LVDS_PLL_PLL_EN_STAT,
+				       1000, 100000);
+	if (ret) {
+		dev_err(ctx->dev, "failed to lock PLL, ret=%i\n", ret);
+		regmap_write(ctx->regmap, REG_RC_PLL_EN, 0x00);
+		return ret;
+	}
+
+	/* Trigger reset after CSR register update. */
+	regmap_write(ctx->regmap, REG_RC_RESET, REG_RC_RESET_SOFT_RESET);
+	/* Wait for 10ms after soft reset as specified in datasheet */
+	usleep_range(10000, 12000);
+	return 0;
+}
+
 static void sn65dsi83_atomic_pre_enable(struct drm_bridge *bridge,
 					struct drm_bridge_state *old_bridge_state)
 {
@@ -334,7 +373,6 @@ static void sn65dsi83_atomic_pre_enable(struct drm_bridge *bridge,
 	struct drm_crtc *crtc;
 	bool lvds_format_24bpp;
 	bool lvds_format_jeida;
-	unsigned int pval;
 	__le16 le16val;
 	u16 val;
 	int ret;
@@ -405,20 +443,37 @@ static void sn65dsi83_atomic_pre_enable(struct drm_bridge *bridge,
 	regmap_write(ctx->regmap, REG_RC_DSI_CLK,
 		     REG_RC_DSI_CLK_DSI_CLK_DIVIDER(sn65dsi83_get_dsi_div(ctx)));
 
-	/* Set number of DSI lanes and LVDS link config. */
+	/* Set number of DSI lanes and LVDS link config.
+	 * For SN65DSI85 dual-link mode, the DSI input is split across both
+	 * LVDS channels; use DSI_CHANNEL_MODE_DUAL (bits 7..5 = 0) and
+	 * mirror the CHA lane count to CHB so the chip properly drives both
+	 * LVDS channels from one DSI input.
+	 */
+	/*
+	 * Match the working linux-imx 6.6.52 driver: this board is a single
+	 * DSI input feeding dual-link LVDS (SN65DSI84 topology), NOT dual DSI
+	 * channel. Use SINGLE channel mode; the previous DUAL mode made the
+	 * chip wait for a second DSI input that does not exist (black screen).
+	 */
 	regmap_write(ctx->regmap, REG_DSI_LANE,
 		     REG_DSI_LANE_DSI_CHANNEL_MODE_SINGLE |
 		     REG_DSI_LANE_CHA_DSI_LANES(~(ctx->dsi->lanes - 1)) |
-		     /* CHB is DSI85-only, set to default on DSI83/DSI84 */
 		     REG_DSI_LANE_CHB_DSI_LANES(3));
 	/* No equalization. */
 	regmap_write(ctx->regmap, REG_DSI_EQ, 0x00);
 
-	/* Set up sync signal polarity. */
-	val = (mode->flags & DRM_MODE_FLAG_NHSYNC ?
-	       REG_LVDS_FMT_HS_NEG_POLARITY : 0) |
-	      (mode->flags & DRM_MODE_FLAG_NVSYNC ?
-	       REG_LVDS_FMT_VS_NEG_POLARITY : 0);
+	/*
+	 * Set up LVDS sync polarity. Prefer the displayconfig table values
+	 * passed via f_sn65dsi8x_{hs,vs}_neg, since on i.MX8MM the Samsung
+	 * DSIM atomic_check forces NHSYNC|NVSYNC in the adjusted mode and
+	 * corrupts mode->flags for this bridge (the panels want active-high).
+	 */
+	val = (f_sn65dsi8x_hs_neg > 0 ? REG_LVDS_FMT_HS_NEG_POLARITY :
+	       f_sn65dsi8x_hs_neg < 0 ? (mode->flags & DRM_MODE_FLAG_NHSYNC ?
+	       REG_LVDS_FMT_HS_NEG_POLARITY : 0) : 0) |
+	      (f_sn65dsi8x_vs_neg > 0 ? REG_LVDS_FMT_VS_NEG_POLARITY :
+	       f_sn65dsi8x_vs_neg < 0 ? (mode->flags & DRM_MODE_FLAG_NVSYNC ?
+	       REG_LVDS_FMT_VS_NEG_POLARITY : 0) : 0);
 
 	/* Set up bits-per-pixel, 18bpp or 24bpp. */
 	if (lvds_format_24bpp) {
@@ -456,40 +511,66 @@ static void sn65dsi83_atomic_pre_enable(struct drm_bridge *bridge,
 	/* 32 + 1 pixel clock to ensure proper operation */
 	le16val = cpu_to_le16(32 + 1);
 	regmap_bulk_write(ctx->regmap, REG_VID_CHA_SYNC_DELAY_LOW, &le16val, 2);
-	le16val = cpu_to_le16(mode->hsync_end - mode->hsync_start);
-	regmap_bulk_write(ctx->regmap, REG_VID_CHA_HSYNC_PULSE_WIDTH_LOW,
-			  &le16val, 2);
-	le16val = cpu_to_le16(mode->vsync_end - mode->vsync_start);
-	regmap_bulk_write(ctx->regmap, REG_VID_CHA_VSYNC_PULSE_WIDTH_LOW,
-			  &le16val, 2);
-	regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_BACK_PORCH,
-		     mode->htotal - mode->hsync_end);
-	regmap_write(ctx->regmap, REG_VID_CHA_VERTICAL_BACK_PORCH,
-		     mode->vtotal - mode->vsync_end);
-	regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_FRONT_PORCH,
-		     mode->hsync_start - mode->hdisplay);
-	regmap_write(ctx->regmap, REG_VID_CHA_VERTICAL_FRONT_PORCH,
-		     mode->vsync_start - mode->vdisplay);
+	/*
+	 * Horizontal HSW/HBP/HFP are forced to 1 (minimum), NOT the mode's
+	 * pixel values. mainline samsung-dsim emits a DSI video frame with
+	 * minimal horizontal blanking (its MHPORCH/MSYNC are forced to 1 for
+	 * SN65DSI8x), so the bridge's CHA horizontal sync check must expect
+	 * the same minimal porch or it raises CHA_SYNCH_ERR (0xe5 bit7) and
+	 * mutes the LVDS output -> black screen. Confirmed live via i2c: with
+	 * HSW/HBP/HFP=1 the SYNCH_ERR clears and the panel renders. The LVDS
+	 * output line timing is derived by the bridge from the active region;
+	 * the panel locks correctly with these values. Vertical timing keeps
+	 * the real mode values.
+	 */
+	{
+		/*
+		 * Dual-link (21" G215HVN01): force HSW/HBP/HFP=1 to match
+		 * samsung-dsim's minimal-porch DSI frame, else CHA_SYNCH_ERR ->
+		 * black. Single-link panels (10") run mainline samsung-dsim
+		 * timing which sends the real pixel-derived porch, so the bridge
+		 * must program the real mode values or the panel cannot lock
+		 * (rolling/garbled). Vertical timing always uses real values.
+		 */
+		u16 hsw = ctx->lvds_dual_link ? 1 :
+			  (mode->hsync_end - mode->hsync_start);
+		u16 hbp = ctx->lvds_dual_link ? 1 :
+			  (mode->htotal - mode->hsync_end);
+		u16 hfp = ctx->lvds_dual_link ? 1 :
+			  (mode->hsync_start - mode->hdisplay);
+
+		le16val = cpu_to_le16(hsw);
+		regmap_bulk_write(ctx->regmap, REG_VID_CHA_HSYNC_PULSE_WIDTH_LOW,
+				  &le16val, 2);
+		le16val = cpu_to_le16(mode->vsync_end - mode->vsync_start);
+		regmap_bulk_write(ctx->regmap, REG_VID_CHA_VSYNC_PULSE_WIDTH_LOW,
+				  &le16val, 2);
+		regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_BACK_PORCH, hbp);
+		regmap_write(ctx->regmap, REG_VID_CHA_VERTICAL_BACK_PORCH,
+			     mode->vtotal - mode->vsync_end);
+		regmap_write(ctx->regmap, REG_VID_CHA_HORIZONTAL_FRONT_PORCH, hfp);
+		regmap_write(ctx->regmap, REG_VID_CHA_VERTICAL_FRONT_PORCH,
+			     mode->vsync_start - mode->vdisplay);
+	}
 	regmap_write(ctx->regmap, REG_VID_CHA_TEST_PATTERN, 0x00);
 
-	/* Enable PLL */
-	regmap_write(ctx->regmap, REG_RC_PLL_EN, REG_RC_PLL_EN_PLL_EN);
-	usleep_range(3000, 4000);
-	ret = regmap_read_poll_timeout(ctx->regmap, REG_RC_LVDS_PLL, pval,
-				       pval & REG_RC_LVDS_PLL_PLL_EN_STAT,
-				       1000, 100000);
-	if (ret) {
-		dev_err(ctx->dev, "failed to lock PLL, ret=%i\n", ret);
-		/* On failure, disable PLL again and exit. */
-		regmap_write(ctx->regmap, REG_RC_PLL_EN, 0x00);
-		return;
-	}
-
-	/* Trigger reset after CSR register update. */
-	regmap_write(ctx->regmap, REG_RC_RESET, REG_RC_RESET_SOFT_RESET);
-
-	/* Wait for 10ms after soft reset as specified in datasheet */
-	usleep_range(10000, 12000);
+	/*
+	 * CHB video timing is intentionally NOT programmed. For single-DSI-input
+	 * dual-link LVDS (SN65DSI84 topology) the chip drives both LVDS links
+	 * from the CHA timing; the working linux-imx 6.6.52 driver leaves CHB
+	 * untouched. Programming it here misconfigured the chip.
+	 *
+	 * PLL enable + soft reset:
+	 *  - dual-link (21"): deferred to atomic_enable() so the bridge locks
+	 *    onto an already-running DSI video stream (mirrors linux-imx
+	 *    a7c5bc19a417); enabling it here left it reset onto a dead link.
+	 *  - single-link (10" etc.): use the mainline location (here). Deferring
+	 *    it on these panels caused an intermittent PLL-lock race at boot
+	 *    (occasional black / rolling / colored edge). This restores the
+	 *    bring-up sequence they booted reliably with for months.
+	 */
+	if (!ctx->lvds_dual_link)
+		sn65dsi83_enable_pll(ctx);
 }
 
 static void sn65dsi83_atomic_enable(struct drm_bridge *bridge,
@@ -497,6 +578,15 @@ static void sn65dsi83_atomic_enable(struct drm_bridge *bridge,
 {
 	struct sn65dsi83 *ctx = bridge_to_sn65dsi83(bridge);
 	unsigned int pval;
+
+	/*
+	 * Dual-link (21"): enable PLL + soft-reset HERE, after the DSI host has
+	 * started the video stream, so the bridge locks onto a live link.
+	 * Single-link panels already did this in atomic_pre_enable() (mainline
+	 * sequence) to avoid an intermittent boot PLL-lock race.
+	 */
+	if (ctx->lvds_dual_link && sn65dsi83_enable_pll(ctx))
+		return;
 
 	/* Clear all errors that got asserted during initialization. */
 	regmap_read(ctx->regmap, REG_IRQ_STAT, &pval);
@@ -606,6 +696,27 @@ static int sn65dsi83_parse_dt(struct sn65dsi83 *ctx, enum sn65dsi83_model model)
 			/* Even pixels to LVDS Channel A, odd pixels to B */
 			ctx->lvds_dual_link_even_odd_swap = true;
 		}
+
+	}
+
+	/*
+	 * Allow the panel driver to force dual-link or single-link via the
+	 * global override flag. Hymatek's eX7xxM family shares one DT
+	 * (imx8mm_us04.dtsi) for all panels, with canonical port@3 +
+	 * dual-lvds-{odd,even}-pixels topology that the bridge driver would
+	 * otherwise interpret as "always dual-link". For single-link panels
+	 * in the family (10.1", 7"), panel-simple keeps f_sn65dsi84_dual_lvds=0
+	 * and we override the DT-derived dual-link to force single-link.
+	 */
+	if (f_sn65dsi84_dual_lvds) {
+		dev_info(dev, "DUAL LVDS forced by panel driver (model=%d)\n",
+			 model);
+		ctx->lvds_dual_link = true;
+		ctx->lvds_dual_link_even_odd_swap = false;
+	} else if (model != MODEL_SN65DSI83) {
+		dev_info(dev, "Single-link forced (panel driver did not request dual-link)\n");
+		ctx->lvds_dual_link = false;
+		ctx->lvds_dual_link_even_odd_swap = false;
 	}
 
 	panel_bridge = devm_drm_of_get_bridge(dev, dev->of_node, 2, 0);
@@ -656,11 +767,34 @@ static int sn65dsi83_host_attach(struct sn65dsi83 *ctx)
 
 	ctx->dsi = dsi;
 
+	/*
+	 * The shared DT declares 4 DSI lanes because the dual-link 21" panel
+	 * needs that bandwidth at 1080p. Single-link panels (10" etc.) ran on
+	 * 2 lanes historically; forcing 4 lanes on them lowers the DSI HS clock
+	 * that the bridge's LVDS PLL is referenced to (REG_RC_LVDS_PLL bit0,
+	 * HS_CLK_SRC = DSI) and degrades the regenerated LVDS pixel clock,
+	 * producing brightness shading and vertical stripes even though the DSI
+	 * link itself is clean (IRQ_STAT = 0). Clamp single-link panels to 2.
+	 */
+	if (!ctx->lvds_dual_link && dsi_lanes > 2)
+		dsi_lanes = 2;
+
 	dsi->lanes = dsi_lanes;
 	dsi->format = MIPI_DSI_FMT_RGB888;
-	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
-			  MIPI_DSI_MODE_VIDEO_NO_HFP | MIPI_DSI_MODE_VIDEO_NO_HBP |
-			  MIPI_DSI_MODE_VIDEO_NO_HSA | MIPI_DSI_MODE_NO_EOT_PACKET;
+	/*
+	 * Dual-link (21" G215HVN01): request only plain burst video mode. The
+	 * upstream defaults (NO_HFP/NO_HBP/NO_HSA/NO_EOT_PACKET) make
+	 * samsung-dsim emit a stripped DSI stream this dual-link panel cannot
+	 * synchronise to (CHA_SYNCH_ERR, black). Single-link panels (10") need
+	 * the mainline flags so samsung-dsim sends the real porch the bridge
+	 * programs on its LVDS side; with plain burst they roll/garble.
+	 */
+	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST;
+	if (!ctx->lvds_dual_link)
+		dsi->mode_flags |= MIPI_DSI_MODE_VIDEO_NO_HFP |
+				   MIPI_DSI_MODE_VIDEO_NO_HBP |
+				   MIPI_DSI_MODE_VIDEO_NO_HSA |
+				   MIPI_DSI_MODE_NO_EOT_PACKET;
 
 	ret = devm_mipi_dsi_attach(dev, dsi);
 	if (ret < 0) {
