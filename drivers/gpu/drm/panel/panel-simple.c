@@ -49,8 +49,13 @@
  *----------------------------------------------------------------------------------------------------------------*/
 extern int hw_dispid; //This is an exported variable holding the display id value, if passed from cmdline
 
+/*
+ * 66000 is for hw_dispid 91, as in EXOR's factory kernel: at 66.6 MHz its
+ * pixel line is shorter than the 792 Mbps DSI line with porches, and the
+ * picture rolls.
+ */
 static const unsigned long avail_pclk_Khz[] = { //List of available LVDS pixel clock frequencies
-	133200, 88500, 76000, 75000, 66600, 62600, 51000, 33200, 30000
+	133200, 88500, 76000, 75000, 66600, 66000, 62600, 51000, 33200, 30000
 };
 
 int dispid_get_videomode(struct videomode* vm, int dispid)

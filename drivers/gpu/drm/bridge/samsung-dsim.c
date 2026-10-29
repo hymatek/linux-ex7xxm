@@ -606,6 +606,8 @@ static unsigned long samsung_dsim_pll_find_pms(struct samsung_dsim *dsi,
 	return best_freq;
 }
 
+extern int hw_dispid;
+
 static unsigned long samsung_dsim_set_pll(struct samsung_dsim *dsi,
 					  unsigned long freq)
 {
@@ -1009,6 +1011,16 @@ static void samsung_dsim_set_display_mode(struct samsung_dsim *dsi)
 			hfp = 1;
 			hbp = 1;
 			hsa = 1;
+		}
+
+		/*
+		 * eX7xxM 10" (hw_dispid 91): the porch word counts EXOR's
+		 * factory kernel sends with this mode, read from its DSIM.
+		 */
+		if (hw_dispid == 91) {
+			hfp = 15;
+			hbp = 70;
+			hsa = 15;
 		}
 
 		dev_dbg(dsi->dev, "calculated hfp: %u, hbp: %u, hsa: %u",
