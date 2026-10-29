@@ -1026,7 +1026,13 @@ static void samsung_dsim_set_display_mode(struct samsung_dsim *dsi)
 		dev_dbg(dsi->dev, "calculated hfp: %u, hbp: %u, hsa: %u",
 			hfp, hbp, hsa);
 
-		reg = DSIM_CMD_ALLOW(0xf)
+		/*
+		 * eX7xxM 21" (hw_dispid 57): as EXOR's factory kernel, no
+		 * command lines in the vertical front porch (MVPORCH
+		 * 0x00050005). With 15 the SN65DSI84 saw DSI CRC/ECC errors
+		 * and a black picture in about 1 of 200 display enables.
+		 */
+		reg = DSIM_CMD_ALLOW(hw_dispid == 57 ? 0 : 0xf)
 			| DSIM_STABLE_VFP(m->vsync_start - m->vdisplay)
 			| DSIM_MAIN_VBP(m->vtotal - m->vsync_end);
 		samsung_dsim_write(dsi, DSIM_MVPORCH_REG, reg);

@@ -794,10 +794,12 @@ static int sn65dsi83_host_attach(struct sn65dsi83 *ctx)
 	 */
 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST;
 	/*
-	 * eX7xxM 10" (hw_dispid 91): as EXOR's factory kernel, porches and EoT
-	 * sent, no FIFO flush on vsync (DSIM CONFIG 0x06007027).
+	 * eX7xxM 10" (hw_dispid 91) and 21" (hw_dispid 57): as EXOR's factory
+	 * kernel, no FIFO flush on vsync (DSIM CONFIG 0x06007027 and
+	 * 0x0600707F); 91 also sends porches and EoT. With the flush the 21"
+	 * picture came back shifted sideways after a display enable.
 	 */
-	if (hw_dispid == 91)
+	if (hw_dispid == 91 || hw_dispid == 57)
 		dsi->mode_flags |= MIPI_DSI_MODE_VSYNC_FLUSH;
 	else if (!ctx->lvds_dual_link)
 		dsi->mode_flags |= MIPI_DSI_MODE_VIDEO_NO_HFP |
