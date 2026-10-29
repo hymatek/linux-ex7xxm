@@ -1460,11 +1460,10 @@ static struct t_DisplayParams displayconfig[] = {
         .brightness_max = 65,
     },
     /* 91: FutureLabs FLC-101HMLG200002#00 24 bit 1280x800
-     * Uses 75 MHz with reduced blanking instead of Exor's 66.6 MHz timings.
-     * The 66.6 MHz clock causes the Samsung DSIM PLL to miss by 1.2 MHz
-     * (798 vs 799.2 MHz target), and the tight blanking (htotal=1380) causes
-     * vertical instability on the SN65DSI83 DSI-to-LVDS bridge. At 75 MHz,
-     * the DSIM PLL locks exactly at 900 MHz with standard reduced blanking.
+     * The timing EXOR's factory kernel runs, read on the panel (66.0 MHz,
+     * htotal 1380, vtotal 824). With NXP's D-PHY timing, our earlier
+     * 75 MHz timing still dropped the picture by its vertical blanking now
+     * and then; this one did not.
      */
     {
         .dispid    = 91,
@@ -1472,17 +1471,17 @@ static struct t_DisplayParams displayconfig[] = {
         .rezy      = 800,
         .bpp       = 24,
 
-        .pclk_freq = 75000,
+        .pclk_freq = 66000,
         .pclk_inv  = 1,
 
-        .hs_fp     = 48,
-        .hs_bp     = 80,
-        .hs_w      = 32,
+        .hs_fp     = 12,
+        .hs_bp     = 86,
+        .hs_w      = 2,
         .hs_inv    = 0,
 
-        .vs_fp     = 3,
-        .vs_bp     = 14,
-        .vs_w      = 6,
+        .vs_fp     = 1,
+        .vs_bp     = 3,
+        .vs_w      = 20,
         .vs_inv    = 0,
 
         .blank_inv      = 0,

@@ -733,6 +733,8 @@ static int sn65dsi83_parse_dt(struct sn65dsi83 *ctx, enum sn65dsi83_model model)
 	return 0;
 }
 
+extern int hw_dispid;
+
 static int sn65dsi83_host_attach(struct sn65dsi83 *ctx)
 {
 	struct device *dev = ctx->dev;
@@ -785,12 +787,19 @@ static int sn65dsi83_host_attach(struct sn65dsi83 *ctx)
 	 * Dual-link (21" G215HVN01): request only plain burst video mode. The
 	 * upstream defaults (NO_HFP/NO_HBP/NO_HSA/NO_EOT_PACKET) make
 	 * samsung-dsim emit a stripped DSI stream this dual-link panel cannot
-	 * synchronise to (CHA_SYNCH_ERR, black). Single-link panels (10") need
-	 * the mainline flags so samsung-dsim sends the real porch the bridge
-	 * programs on its LVDS side; with plain burst they roll/garble.
+	 * synchronise to (CHA_SYNCH_ERR, black). Single-link panels (10")
+	 * other than hw_dispid 91 (below) need the mainline flags so
+	 * samsung-dsim sends the real porch the bridge programs on its LVDS
+	 * side; with plain burst they roll/garble.
 	 */
 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST;
-	if (!ctx->lvds_dual_link)
+	/*
+	 * eX7xxM 10" (hw_dispid 91): as EXOR's factory kernel, porches and EoT
+	 * sent, no FIFO flush on vsync (DSIM CONFIG 0x06007027).
+	 */
+	if (hw_dispid == 91)
+		dsi->mode_flags |= MIPI_DSI_MODE_VSYNC_FLUSH;
+	else if (!ctx->lvds_dual_link)
 		dsi->mode_flags |= MIPI_DSI_MODE_VIDEO_NO_HFP |
 				   MIPI_DSI_MODE_VIDEO_NO_HBP |
 				   MIPI_DSI_MODE_VIDEO_NO_HSA |
