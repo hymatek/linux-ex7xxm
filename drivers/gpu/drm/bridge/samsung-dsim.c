@@ -26,6 +26,8 @@
 #include <drm/drm_panel.h>
 #include <drm/drm_print.h>
 
+#include "samsung-dsim-dphy-ln14lpp.h"
+
 /* returns true iff both arguments logically differs */
 #define NEQV(a, b) (!(a) ^ !(b))
 
@@ -747,6 +749,8 @@ static void samsung_dsim_set_phy_ctrl(struct samsung_dsim *dsi)
 	 * to sync at a variety of resolutions. If someone
 	 * can get a more accurate mathematical equation needed
 	 * for these registers, this should be updated.
+	 * On i.MX8M the driver now uses NXP's table below; this formula
+	 * only runs outside its 75-2105 Mbps and on Exynos.
 	 */
 
 	lpx = PS_TO_CYCLE(cfg.lpx, byte_clock);
@@ -758,6 +762,32 @@ static void samsung_dsim_set_phy_ctrl(struct samsung_dsim *dsi)
 	hs_prepare = PS_TO_CYCLE(cfg.hs_prepare, byte_clock);
 	hs_zero = PS_TO_CYCLE(cfg.hs_zero, byte_clock);
 	hs_trail = PS_TO_CYCLE(cfg.hs_trail, byte_clock);
+
+	/*
+	 * i.MX8M: take the timing from NXP's table, as their sec-dsim driver
+	 * and EXOR's factory kernel do (the row within 5 Mbps of the lane
+	 * rate). The formula above only approximates it; see the TODO.
+	 */
+	if (!samsung_dsim_hw_is_exynos(dsi->plat_data->hw_type)) {
+		const struct samsung_dsim_dphy_timing *t = samsung_dsim_dphy_ln14lpp;
+		unsigned int mbps = DIV_ROUND_CLOSEST_ULL(dsi->hs_clock, 1000000);
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(samsung_dsim_dphy_ln14lpp); i++, t++) {
+			if (abs((int)t->bit_clk - (int)mbps) > 5)
+				continue;
+			clk_prepare = t->clk_prepare;
+			clk_zero = t->clk_zero;
+			clk_post = t->clk_post;
+			clk_trail = t->clk_trail;
+			hs_prepare = t->hs_prepare;
+			hs_zero = t->hs_zero;
+			hs_trail = t->hs_trail;
+			lpx = t->lpx;
+			hs_exit = t->hs_exit;
+			break;
+		}
+	}
 
 	/* B D-PHY: D-PHY Master & Slave Analog Block control */
 	reg = reg_values[PHYCTRL_ULPS_EXIT] | reg_values[PHYCTRL_VREG_LP] |
